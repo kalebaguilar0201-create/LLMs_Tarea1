@@ -22,6 +22,7 @@ NO es un Transformer: tanto el encoder como el decoder son recurrentes; lo únic
 
 import copy
 import math
+import os
 import random
 import time
 from typing import Callable, List, Optional, Sequence, Tuple
@@ -192,16 +193,48 @@ def count_parameters(model: nn.Module) -> int:
 
 
 # --------------------------------------------------------------------------
+# Logging
+# --------------------------------------------------------------------------
+def make_logger(path: Optional[str] = None) -> Callable[[str], None]:
+    """Regresa una función log(msg) que imprime con hora y, si se da `path`,
+    agrega la misma línea al archivo (útil para `tail -f logs/<modelo>.log`)."""
+    if path is not None:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+
+    def log(msg: str) -> None:
+        line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
+        print(line, flush=True)
+        if path is not None:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+    return log
+
+
+def gpu_mem() -> str:
+    """Memoria máxima de GPU usada desde el último reset (o '-' si no hay CUDA)."""
+    if torch.cuda.is_available():
+        return f"{torch.cuda.max_memory_allocated() / 1e9:.2f}GB"
+    return "-"
+
+
+# --------------------------------------------------------------------------
 # Entrenamiento
 # --------------------------------------------------------------------------
 def run_epoch(model, loader, criterion, device, optimizer=None, clip: float = 1.0,
-              teacher_forcing: float = 1.0) -> float:
-    """Regresa la pérdida promedio por token. Si optimizer es None, sólo evalúa."""
+              teacher_forcing: float = 1.0, log: Optional[Callable[[str], None]] = None,
+              log_every: int = 0, epoch: int = 0) -> float:
+    """Regresa la pérdida promedio por token. Si optimizer es None, sólo evalúa.
+
+    En entrenamiento, cada `log_every` batches registra loss acumulada,
+    tokens/s y ETA de la época.
+    """
     train = optimizer is not None
     model.train(train)
     total, n_tok = 0.0, 0
+    n_batches = len(loader)
+    t0 = time.time()
     with torch.set_grad_enabled(train):
-        for src, src_lens, tgt in loader:
+        for b, (src, src_lens, tgt) in enumerate(loader, 1):
             src, src_lens, tgt = src.to(device), src_lens.to(device), tgt.to(device)
             tgt_in, tgt_out = tgt[:, :-1], tgt[:, 1:]
             logits = model(src, src_lens, tgt_in, teacher_forcing if train else 1.0)
@@ -214,6 +247,12 @@ def run_epoch(model, loader, criterion, device, optimizer=None, clip: float = 1.
             ntok = (tgt_out != criterion.ignore_index).sum().item()
             total += loss.item() * ntok
             n_tok += ntok
+
+            if train and log is not None and log_every and (b % log_every == 0 or b == n_batches):
+                el = time.time() - t0
+                eta = el / b * (n_batches - b)
+                log(f"  ep {epoch:02d} [{b:>5}/{n_batches}] train loss {total / n_tok:.4f} "
+                    f"| {n_tok / el:,.0f} tok/s | {el:.0f}s, ETA época {eta:.0f}s")
     return total / max(1, n_tok)
 
 
@@ -221,11 +260,13 @@ def fit(model: Seq2SeqAttention, train_loader, val_loader, tgt_pad_id: int, devi
         lr: float = 1e-3, num_epochs: int = 20, patience: int = 3, clip: float = 1.0,
         teacher_forcing: float = 1.0, label_smoothing: float = 0.1,
         save_path: Optional[str] = None, val_bleu_fn: Optional[Callable[[], float]] = None,
-        log: Callable[[str], None] = print) -> dict:
+        log: Callable[[str], None] = print, log_every: int = 100) -> dict:
     """Entrena con Adam y early stopping sobre la pérdida de VAL (nunca Test).
 
-    Si se pasa `val_bleu_fn` (función sin argumentos que regresa BLEU en una
-    muestra de Val), también se registra en el historial.
+    * Cada `log_every` batches registra el avance dentro de la época.
+    * Al final de cada época registra train/val loss, val PPL, val BLEU (si se
+      pasa `val_bleu_fn`), lr, tiempo y memoria de GPU.
+    * Sólo se guarda UN checkpoint (`save_path`): se sobrescribe cuando mejora val loss.
     """
     model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -233,39 +274,59 @@ def fit(model: Seq2SeqAttention, train_loader, val_loader, tgt_pad_id: int, devi
     train_crit = nn.CrossEntropyLoss(ignore_index=tgt_pad_id, label_smoothing=label_smoothing)
     eval_crit = nn.CrossEntropyLoss(ignore_index=tgt_pad_id)
 
-    history = {"train_loss": [], "val_loss": [], "val_ppl": [], "val_bleu": [], "epoch_time": []}
+    log(f"Inicio | params={count_parameters(model):,} | pares train={len(train_loader.dataset):,} "
+        f"| batches/época={len(train_loader)} | max épocas={num_epochs} | patience={patience} "
+        f"| lr={lr} | device={device}")
+
+    history = {"train_loss": [], "val_loss": [], "val_ppl": [], "val_bleu": [], "epoch_time": [],
+               "best_epoch": 0}
     best_loss, best_state, bad = float("inf"), None, 0
+    t_start = time.time()
     for epoch in range(1, num_epochs + 1):
         t0 = time.time()
-        tr = run_epoch(model, train_loader, train_crit, device, optimizer, clip, teacher_forcing)
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+        tr = run_epoch(model, train_loader, train_crit, device, optimizer, clip, teacher_forcing,
+                       log=log, log_every=log_every, epoch=epoch)
         va = run_epoch(model, val_loader, eval_crit, device)
         scheduler.step(va)
-        dt = time.time() - t0
         history["train_loss"].append(tr)
         history["val_loss"].append(va)
         history["val_ppl"].append(math.exp(va))
-        history["epoch_time"].append(dt)
-        msg = (f"Epoch {epoch:02d} | train loss {tr:.3f} | val loss {va:.3f} "
-               f"| val PPL {math.exp(va):7.2f} | lr {optimizer.param_groups[0]['lr']:.1e} | {dt:.0f}s")
+        bleu_msg = ""
         if val_bleu_fn is not None:
             b = val_bleu_fn()
             history["val_bleu"].append(b)
-            msg += f" | val BLEU {b:.2f}"
-        log(msg)
+            bleu_msg = f" | val BLEU {b:.2f}"
+        dt = time.time() - t0
+        history["epoch_time"].append(dt)
 
-        if va < best_loss:
+        improved = va < best_loss
+        if improved:
             best_loss, bad = va, 0
+            history["best_epoch"] = epoch
             best_state = copy.deepcopy(model.state_dict())
             if save_path is not None:
+                os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
                 torch.save(best_state, save_path)
         else:
             bad += 1
-            if bad >= patience:
-                log(f"Early stopping en epoch {epoch} (mejor val loss = {best_loss:.3f})")
-                break
+
+        status = (f"* mejor -> {save_path}" if save_path else "* mejor") if improved \
+            else f"sin mejora {bad}/{patience}"
+        log(f"Epoch {epoch:02d}/{num_epochs} | train loss {tr:.3f} | val loss {va:.3f} "
+            f"| val PPL {math.exp(va):7.2f}{bleu_msg} | lr {optimizer.param_groups[0]['lr']:.1e} "
+            f"| {dt:.0f}s | GPU {gpu_mem()} | {status}")
+
+        if bad >= patience:
+            log(f"Early stopping en epoch {epoch}")
+            break
     if best_state is not None:
         model.load_state_dict(best_state)
     history["best_val_loss"] = best_loss
+    history["total_time"] = time.time() - t_start
+    log(f"Fin | {history['total_time'] / 60:.1f} min | mejor val loss {best_loss:.3f} "
+        f"en epoch {history['best_epoch']}")
     return history
 
 

@@ -15,8 +15,11 @@ tokens, de modo que sus perplejidades sean comparables:
 donde N es el número total de tokens predichos (palabras + </s>).
 """
 
+import copy
 import math
+import os
 import random
+import time
 from collections import Counter
 from typing import Callable, Iterable, List, Optional, Sequence, Tuple
 
@@ -189,6 +192,31 @@ def perplexity(model: nn.Module, loader, device: torch.device, pad_id: int) -> f
 
 
 # --------------------------------------------------------------------------
+# Logging
+# --------------------------------------------------------------------------
+def make_logger(path: Optional[str] = None) -> Callable[[str], None]:
+    """Regresa una función log(msg) que imprime con hora y, si se da `path`,
+    agrega la misma línea al archivo (útil para `tail -f logs/<modelo>.log`)."""
+    if path is not None:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+
+    def log(msg: str) -> None:
+        line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
+        print(line, flush=True)
+        if path is not None:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+    return log
+
+
+def gpu_mem() -> str:
+    """Memoria máxima de GPU usada desde el último reset (o '-' si no hay CUDA)."""
+    if torch.cuda.is_available():
+        return f"{torch.cuda.max_memory_allocated() / 1e9:.2f}GB"
+    return "-"
+
+
+# --------------------------------------------------------------------------
 # Loop de entrenamiento genérico (NLM y RNN)
 # --------------------------------------------------------------------------
 def train_lm(model: nn.Module,
@@ -202,28 +230,37 @@ def train_lm(model: nn.Module,
              patience: int = 3,
              clip: Optional[float] = 1.0,
              save_path: Optional[str] = None,
-             log: Callable[[str], None] = print) -> dict:
+             log: Callable[[str], None] = print,
+             log_every: int = 50) -> dict:
     """Entrena con Adam + CrossEntropy, early stopping sobre la PPL de 'dev'.
 
-    Regresa un diccionario con el historial (loss/ppl por época) y deja en
-    `model` los pesos del mejor epoch.
-    """
-    import copy
-    import time
+    * Cada `log_every` batches registra loss/PPL acumulados, tokens/s y ETA de la época.
+    * Al final de cada época registra train/dev PPL, lr, tiempo y memoria de GPU.
+    * Sólo se guarda UN checkpoint (`save_path`): se sobrescribe cuando mejora dev PPL.
 
+    Regresa el historial y deja en `model` los pesos del mejor epoch.
+    """
     model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=1)
     crit = nn.CrossEntropyLoss(ignore_index=pad_id, reduction="sum")
 
-    history = {"train_ppl": [], "dev_ppl": [], "epoch_time": []}
+    n_batches = len(train_loader)
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    log(f"Inicio | {model.__class__.__name__} | params={n_params:,} | batches/época={n_batches} "
+        f"| max épocas={num_epochs} | patience={patience} | lr={lr} | device={device}")
+
+    history = {"train_ppl": [], "dev_ppl": [], "epoch_time": [], "best_epoch": 0}
     best_ppl, best_state, bad_epochs = float("inf"), None, 0
+    t_start = time.time()
 
     for epoch in range(1, num_epochs + 1):
         t0 = time.time()
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
         model.train()
         tot, n = 0.0, 0
-        for x, y in train_loader:
+        for b, (x, y) in enumerate(train_loader, 1):
             x, y = x.to(device), y.to(device)
             optimizer.zero_grad()
             logits = model(x)
@@ -237,6 +274,13 @@ def train_lm(model: nn.Module,
             tot += loss_sum.item()
             n += ntok.item()
 
+            if log_every and (b % log_every == 0 or b == n_batches):
+                el = time.time() - t0
+                eta = el / b * (n_batches - b)
+                log(f"  ep {epoch:02d} [{b:>5}/{n_batches}] loss {tot / n:.4f} "
+                    f"| PPL {perplexity_from_nll(tot, n):9.2f} | {n / el:,.0f} tok/s "
+                    f"| {el:.0f}s, ETA época {eta:.0f}s")
+
         train_ppl = perplexity_from_nll(tot, n)
         dev_ppl = perplexity(model, dev_loader, device, pad_id)
         scheduler.step(dev_ppl)
@@ -244,23 +288,33 @@ def train_lm(model: nn.Module,
         history["train_ppl"].append(train_ppl)
         history["dev_ppl"].append(dev_ppl)
         history["epoch_time"].append(dt)
-        log(f"Epoch {epoch:02d} | train PPL {train_ppl:9.2f} | dev PPL {dev_ppl:9.2f} "
-            f"| lr {optimizer.param_groups[0]['lr']:.1e} | {dt:.1f}s")
 
-        if dev_ppl < best_ppl:
+        improved = dev_ppl < best_ppl
+        if improved:
             best_ppl, bad_epochs = dev_ppl, 0
+            history["best_epoch"] = epoch
             best_state = copy.deepcopy(model.state_dict())
             if save_path is not None:
+                os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
                 torch.save(best_state, save_path)
         else:
             bad_epochs += 1
-            if bad_epochs >= patience:
-                log(f"Early stopping en epoch {epoch} (mejor dev PPL = {best_ppl:.2f})")
-                break
+
+        status = (f"* mejor -> {save_path}" if save_path else "* mejor") if improved \
+            else f"sin mejora {bad_epochs}/{patience}"
+        log(f"Epoch {epoch:02d}/{num_epochs} | train PPL {train_ppl:9.2f} | dev PPL {dev_ppl:9.2f} "
+            f"| best {best_ppl:9.2f} (ep {history['best_epoch']}) | lr {optimizer.param_groups[0]['lr']:.1e} "
+            f"| {dt:.1f}s | GPU {gpu_mem()} | {status}")
+
+        if bad_epochs >= patience:
+            log(f"Early stopping en epoch {epoch}")
+            break
 
     if best_state is not None:
         model.load_state_dict(best_state)
     history["best_dev_ppl"] = best_ppl
+    history["total_time"] = time.time() - t_start
+    log(f"Fin | {history['total_time'] / 60:.1f} min | mejor dev PPL {best_ppl:.2f} en epoch {history['best_epoch']}")
     return history
 
 

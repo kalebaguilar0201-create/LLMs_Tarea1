@@ -40,7 +40,9 @@ Las instrucciones completas están en [`referencias/mLLMs_Fall_2026_Tarea1_RLM_a
     └── Tarea5_NLM.ipynb                 # NLM de Bengio (base de nlm.py)
 ```
 
-Las carpetas `Task1_Language_Modelling/` y `Task2_Machine_Translation/` sólo contienen **código (`.py`) y datos**. Todos los experimentos se ejecutan desde el notebook único del root, que agrega ambas carpetas al `sys.path`, importa sus módulos y lee los datos desde `<task>/data/`. Los pesos de los modelos entrenados se guardan en `checkpoints/` (ignorado por git).
+Las carpetas `Task1_Language_Modelling/` y `Task2_Machine_Translation/` sólo contienen **código (`.py`) y datos**. Todos los experimentos se ejecutan desde el notebook único del root, que agrega ambas carpetas al `sys.path`, importa sus módulos y lee los datos desde `<task>/data/`. Durante la ejecución se crean (ambos ignorados por git):
+- `checkpoints/` — **sólo el mejor checkpoint** de cada modelo (`<modelo>_best.pt`), que se sobrescribe cuando mejora en *dev*/Val.
+- `logs/` — un log por entrenamiento (`rnn_attention.log`, `rnn_no_attention.log`, `bengio.log`, `seq2seq_X.log`, `seq2seq_2X.log`).
 
 ---
 
@@ -105,7 +107,7 @@ Organizado con encabezados markdown en el orden de los puntos del PDF; cada punt
   - `α_t = softmax(Q Kᵀ / √d_k)` con máscara sobre `<pad>`; `c_t = α_t V`
   - `z_t = tanh(W_c [s_t; c_t])`, `P(y_t) = softmax(W_o z_t)`
 - **Entrenamiento:** teacher forcing, Adam (lr 1e-3), label smoothing 0.1, grad-clip 1.0, `ReduceLROnPlateau`, early stopping sobre la pérdida de Val. Decodificación greedy.
-- **X por defecto = 50,000** (2X = 100,000 ≤ 226,800); se ajusta en la sección 2.2 del notebook según los recursos disponibles. Los vocabularios se construyen sólo con los pares de entrenamiento de cada experimento. Las métricas se calculan en minúsculas (`lowercase=True`) porque el modelo se entrena en minúsculas.
+- **X por defecto = 100,000** (2X = 200,000 ≤ 226,800), batch 256, pensado para una GPU de 24 GB; se ajusta en la sección 2.2 del notebook (bajar a 50,000 si el tiempo no alcanza). Los vocabularios se construyen sólo con los pares de entrenamiento de cada experimento. Las métricas se calculan en minúsculas (`lowercase=True`) porque el modelo se entrena en minúsculas.
 
 ---
 
@@ -116,7 +118,19 @@ python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Se recomienda GPU (Google Colab o el cluster de CIMAT), sobre todo para la Parte 2.
+Se recomienda GPU (Google Colab o el cluster de CIMAT), sobre todo para la Parte 2. La configuración por defecto está pensada para una GPU de 24 GB.
+
+## Épocas de entrenamiento
+
+| Modelo | Máx. épocas | Early stopping | Métrica de parada | Batch |
+|---|---|---|---|---|
+| LSTM + Self-Attention | 30 | patience 3 | PPL en *dev* (10 % de Train) | 64 |
+| LSTM sin atención | 30 | patience 3 | PPL en *dev* | 64 |
+| NLM Bengio | 30 | patience 3 | PPL en *dev* | 256 |
+| SLM (n-gramas) | — (conteos, sin entrenamiento iterativo) | — | — | — |
+| Seq2Seq X / 2X | 20 | patience 3 | loss en Val | 256 |
+
+En todos: `ReduceLROnPlateau` (factor 0.5, patience 1) y se conservan los pesos de la mejor época.
 
 ## Ejecución
 
@@ -132,6 +146,17 @@ En Google Colab:
 %cd LLMs_Tarea1
 !pip install -q sacrebleu nltk
 # abrir / ejecutar kaleb_alejandro_aguilar_avila.ipynb desde este directorio
+```
+
+## Monitoreo del entrenamiento
+
+Cada entrenamiento imprime en el notebook y además escribe en `logs/<modelo>.log`:
+- cada N batches: loss acumulada, tokens/s y ETA de la época;
+- al final de cada época: train/dev(val) PPL o loss, BLEU en una muestra de Val (Parte 2), lr, tiempo, memoria máxima de GPU y si se guardó un nuevo mejor checkpoint (`*`) o cuántas épocas lleva sin mejorar;
+- al final: tiempo total y mejor época.
+
+```bash
+tail -f logs/seq2seq_2X.log
 ```
 
 ## Entrega
