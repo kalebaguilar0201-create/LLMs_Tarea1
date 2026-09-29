@@ -30,7 +30,7 @@ import torch
 import torch.nn as nn
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
-from data import Vocab, detokenize, tokenize
+from mt_data import Vocab, detokenize, tokenize
 
 
 # --------------------------------------------------------------------------
