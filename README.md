@@ -80,7 +80,7 @@ Organizado con encabezados markdown en el orden de los puntos del PDF; cada punt
 
 | Punto | Pts | Modelo | Archivo | Detalles |
 |---|---|---|---|---|
-| 1 | 20 | RNN LM con Self-Attention (LSTM y GRU) | `Task1_Language_Modelling/rnn_attention_lm.py` | Embedding(256) → **LSTM o GRU** 512 **unidireccional** → **10 bloques** (`AttentionBlock`): self-attention causal multi-cabeza (16) con `Q = zW_Q, K = zW_K, V = zW_V`, `softmax(QKᵀ/√d_k + máscara causal)` → `tanh(W_c[z; c])` + residual + LayerNorm → softmax. Adam, grad-clip 1.0, early stopping (patience 10). |
+| 1 | 20 | RNN LM con Self-Attention (LSTM y GRU) | `Task1_Language_Modelling/rnn_attention_lm.py` | Embedding(256) → **LSTM o GRU** 512 **unidireccional** → **10 bloques tipo Transformer** (`AttentionBlock`): **Masked Multi-Head Attention** (16 cabezas) con `Q = zW_Q, K = zW_K, V = zW_V`, `softmax(QKᵀ/√d_k + M)V` (máscara del decoder) + feed-forward `Linear → ReLU → Linear`, cada una con residual + LayerNorm → softmax. Adam, grad-clip 1.0, early stopping (patience 10). |
 | 2 | 0 | Statistical LM | `Task1_Language_Modelling/slm.py` | n-gramas con suavizado add-k (Laplace) o interpolación lineal (Jelinek-Mercer); orden n ∈ {2,3,4} y lambdas elegidos sobre *dev*. |
 | 3 | 0 | Neural LM (Bengio 2003) | `Task1_Language_Modelling/nlm.py` | Ventana de 3 palabras → embeddings concatenados → `tanh` → dropout → softmax (basado en `referencias/Tarea5_NLM.ipynb`). |
 | 4 | 20 | Comparación de PPL | notebook, sección 1.4 | Tabla SLM vs NLM vs {LSTM, GRU} × {con atención, **sin atención**} (`use_attention=False`, todo lo demás idéntico). |

@@ -5,27 +5,28 @@ Arquitectura (a nivel palabra, un tuit por secuencia):
 
     x_1..x_T --Embedding--> e_t --LSTM o GRU (unidireccional)--> h_t = z^(0)
                                                                     |
-     para l = 1..L  (L = n_attn_layers, por defecto 10):            |
-               Self-attention causal tipo Transformer (Q, K, V) <---+
-                    Q = z W_Q^l,  K = z W_K^l,  V = z W_V^l
-                    A = softmax( Q K^T / sqrt(d_k)  + máscara causal )
-                    c_t = sum_{j<=t} A_tj V_j            (multi-cabeza)
-                    u_t = tanh( W_c^l [z_t ; c_t] )
-                    z^(l) = LayerNorm( z^(l-1) + dropout(u) )   (residual)
+     para l = 1..L  (L = n_attn_layers):                            |
+          Masked Multi-Head Attention (Vaswani et al., 2017) <------+
+               Q = z W_Q,  K = z W_K,  V = z W_V
+               Attention(Q, K, V) = softmax( Q K^T / sqrt(d_k) + M ) V
+               z = LayerNorm( z + Dropout(Attention(z)) )
+          Feed-Forward (Linear -> ReLU -> Linear)
+               z = LayerNorm( z + Dropout(FFN(z)) )
                                                                     |
                logits = W_o  dropout(z^(L))  --> softmax
 
 Notas de diseño:
     * `rnn_type` = 'lstm' o 'gru'. La RNN es UNIDIRECCIONAL: una bidireccional
       "vería" el futuro y no sería un modelo de lenguaje válido (P(w_t | w_<t)).
-    * Cada bloque usa máscara causal, así que aun apilando L bloques la
-      posición t sólo depende de posiciones j <= t. Como el padding está a la
-      derecha, la máscara causal también evita que los tokens reales atiendan a <pad>.
-    * La conexión residual + LayerNorm en cada bloque facilita entrenar varios
-      bloques apilados (evita que el gradiente se atenúe a través de varios tanh).
-    * `use_attention=False` elimina la atención de cada bloque
-      (u_t = tanh(W_c^l z_t)) y deja todo lo demás idéntico (mismo número de
-      bloques, residual y LayerNorm): es la ablación que pide el punto 4.
+    * M es la máscara del decoder del Transformer: M_ij = 0 si j <= i y -inf si
+      j > i. Sin ella, la posición i vería la palabra que debe predecir.
+      Como el padding está a la derecha, también evita que los tokens reales
+      atiendan a <pad>.
+    * Cada bloque es una capa clásica de Transformer (post-LN): atención y
+      feed-forward con conexión residual + LayerNorm. `ff_mult=0` quita la
+      feed-forward (bloque sólo de atención).
+    * `use_attention=False` quita la subcapa de atención de cada bloque y deja
+      todo lo demás idéntico: es la ablación que pide el punto 4.
 """
 
 import math
@@ -86,9 +87,14 @@ def make_loader(corpus: Sequence[str], vocab: Vocab, batch_size: int = 64, shuff
 
 
 # --------------------------------------------------------------------------
-# Self-attention causal con Q, K, V explícitos
+# Masked Multi-Head Attention (Vaswani et al., 2017 — decoder)
 # --------------------------------------------------------------------------
-class CausalSelfAttention(nn.Module):
+class MaskedMultiHeadAttention(nn.Module):
+    """Attention(Q, K, V) = softmax( Q K^T / sqrt(d_k) + M ) V
+
+    M es la máscara del decoder: M_ij = 0 si j <= i, -inf si j > i
+    (la palabra i sólo puede ver las palabras anteriores y a sí misma)."""
+
     def __init__(self, d_model: int, n_heads: int = 4, dropout: float = 0.1):
         super().__init__()
         assert d_model % n_heads == 0, "d_model debe ser divisible entre n_heads"
@@ -100,52 +106,75 @@ class CausalSelfAttention(nn.Module):
         self.W_O = nn.Linear(d_model, d_model, bias=False)
         self.drop = nn.Dropout(dropout)
 
-    def forward(self, h: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # h: (B, T, d_model) -> estados de la RNN o salida del bloque anterior
-        B, T, _ = h.shape
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # x: (B, T, d_model) -> estados de la RNN o salida del bloque anterior
+        B, T, D = x.shape
+        H, d_k = self.n_heads, self.d_k
 
-        def split(t):  # (B, T, d) -> (B, heads, T, d_k)
-            return t.view(B, T, self.n_heads, self.d_k).transpose(1, 2)
+        # 1) Proyecciones lineales: Q, K, V
+        Q = self.W_Q(x)
+        K = self.W_K(x)
+        V = self.W_V(x)
 
-        Q = split(self.W_Q(h))
-        K = split(self.W_K(h))
-        V = split(self.W_V(h))
+        # 2) Separar en H cabezas: (B, T, D) -> (B, H, T, d_k)
+        Q = Q.view(B, T, H, d_k).transpose(1, 2)
+        K = K.view(B, T, H, d_k).transpose(1, 2)
+        V = V.view(B, T, H, d_k).transpose(1, 2)
 
-        scores = Q @ K.transpose(-2, -1) / math.sqrt(self.d_k)           # (B, H, T, T)
-        causal = torch.triu(torch.ones(T, T, dtype=torch.bool, device=h.device), diagonal=1)
-        scores = scores.masked_fill(causal, float("-inf"))
-        attn = torch.softmax(scores, dim=-1)                              # pesos de atención
-        ctx = self.drop(attn) @ V                                         # (B, H, T, d_k)
-        ctx = ctx.transpose(1, 2).contiguous().view(B, T, -1)             # (B, T, d_model)
-        return self.W_O(ctx), attn
+        # 3) Scaled dot-product: similitud entre cada query y cada key
+        scores = Q @ K.transpose(-2, -1) / math.sqrt(d_k)                 # (B, H, T, T)
+
+        # 4) Máscara del decoder: la posición i sólo ve las posiciones j <= i
+        mask = torch.tril(torch.ones(T, T, dtype=torch.bool, device=x.device))
+        scores = scores.masked_fill(~mask, float("-inf"))
+
+        # 5) Pesos de atención
+        attn = torch.softmax(scores, dim=-1)                              # (B, H, T, T)
+
+        # 6) Promedio ponderado de los values
+        out = self.drop(attn) @ V                                         # (B, H, T, d_k)
+
+        # 7) Concatenar cabezas y proyección de salida
+        out = out.transpose(1, 2).contiguous().view(B, T, D)              # (B, T, D)
+        return self.W_O(out), attn
 
 
 # --------------------------------------------------------------------------
-# Bloque: atención + feed-forward (W_c), con residual y LayerNorm
+# Bloque tipo Transformer: atención + feed-forward (ReLU), residual y LayerNorm
 # --------------------------------------------------------------------------
 class AttentionBlock(nn.Module):
-    """z -> att(z) -> tanh(W_c [z ; c]) -> LayerNorm(z + ...)
-    Con use_attention=False el bloque sólo hace tanh(W_c z) (ablación)."""
+    """z = LayerNorm(z + Dropout(Attention(z)))
+    z = LayerNorm(z + Dropout(FFN(z)))        FFN = Linear -> ReLU -> Linear
 
-    def __init__(self, hidden_dim: int, n_heads: int, dropout: float, use_attention: bool = True):
+    use_attention=False quita la subcapa de atención (ablación del punto 4).
+    ff_mult=0 quita la feed-forward (bloque sólo de atención)."""
+
+    def __init__(self, hidden_dim: int, n_heads: int, dropout: float,
+                 use_attention: bool = True, ff_mult: int = 4):
         super().__init__()
         self.use_attention = use_attention
         if use_attention:
-            self.attn = CausalSelfAttention(hidden_dim, n_heads, dropout=0.1)
-            self.ff = nn.Linear(2 * hidden_dim, hidden_dim)      # W_c [z ; c]
-        else:
-            self.ff = nn.Linear(hidden_dim, hidden_dim)          # W_c z
+            self.attn = MaskedMultiHeadAttention(hidden_dim, n_heads, dropout=0.1)
+            self.norm1 = nn.LayerNorm(hidden_dim)
+        self.ff = None
+        if ff_mult > 0:
+            self.ff = nn.Sequential(
+                nn.Linear(hidden_dim, ff_mult * hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(ff_mult * hidden_dim, hidden_dim),
+            )
+            self.norm2 = nn.LayerNorm(hidden_dim)
         self.drop = nn.Dropout(dropout)
-        self.norm = nn.LayerNorm(hidden_dim)
 
     def forward(self, z: torch.Tensor):
         a = None
         if self.use_attention:
             c, a = self.attn(z)
-            u = torch.tanh(self.ff(torch.cat([z, c], dim=-1)))
-        else:
-            u = torch.tanh(self.ff(z))
-        return self.norm(z + self.drop(u)), a
+            z = self.norm1(z + self.drop(c))
+        if self.ff is not None:
+            z = self.norm2(z + self.drop(self.ff(z)))
+        return z, a
 
 
 # --------------------------------------------------------------------------
@@ -155,7 +184,7 @@ class RNNAttentionLM(nn.Module):
     def __init__(self, vocab_size: int, emb_dim: int = 256, hidden_dim: int = 512,
                  num_layers: int = 2, n_heads: int = 4, dropout: float = 0.4,
                  rnn_type: str = "lstm", use_attention: bool = True, pad_id: int = 0,
-                 n_attn_layers: int = 10):
+                 n_attn_layers: int = 10, ff_mult: int = 4):
         super().__init__()
         self.use_attention = use_attention
         self.emb = nn.Embedding(vocab_size, emb_dim, padding_idx=pad_id)
@@ -163,8 +192,8 @@ class RNNAttentionLM(nn.Module):
         rnn_cls = {"lstm": nn.LSTM, "gru": nn.GRU}[rnn_type.lower()]
         self.rnn = rnn_cls(emb_dim, hidden_dim, num_layers=num_layers, batch_first=True,
                            dropout=dropout if num_layers > 1 else 0.0)
-        # att -> ff -> att -> ff -> att -> ff
-        self.blocks = nn.ModuleList([AttentionBlock(hidden_dim, n_heads, dropout, use_attention)
+        # (atención -> feed-forward) x n_attn_layers
+        self.blocks = nn.ModuleList([AttentionBlock(hidden_dim, n_heads, dropout, use_attention, ff_mult)
                                      for _ in range(n_attn_layers)])
         self.out_drop = nn.Dropout(dropout)
         self.out = nn.Linear(hidden_dim, vocab_size)
