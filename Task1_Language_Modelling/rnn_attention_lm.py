@@ -6,11 +6,11 @@ Arquitectura (a nivel palabra, un tuit por secuencia):
     x_1..x_T --Embedding--> e_t --LSTM o GRU (unidireccional)--> h_t = z^(0)
                                                                     |
      para l = 1..L  (L = n_attn_layers):                            |
-          Masked Multi-Head Attention (Vaswani et al., 2017) <------+
+          Masked Multi-Head Attention con n_heads[l] cabezas <------+
                Q = z W_Q,  K = z W_K,  V = z W_V
                Attention(Q, K, V) = softmax( Q K^T / sqrt(d_k) + M ) V
                z = LayerNorm( z + Dropout(Attention(z)) )
-          Feed-Forward (Linear -> ReLU -> Linear)
+          Feed-Forward  hidden -> ff_dim[l] -> hidden  (ReLU)
                z = LayerNorm( z + Dropout(FFN(z)) )
                                                                     |
                logits = W_o  dropout(z^(L))  --> softmax
@@ -23,14 +23,20 @@ Notas de diseño:
       Como el padding está a la derecha, también evita que los tokens reales
       atiendan a <pad>.
     * Cada bloque es una capa clásica de Transformer (post-LN): atención y
-      feed-forward con conexión residual + LayerNorm. `ff_mult=0` quita la
-      feed-forward (bloque sólo de atención).
+      feed-forward con conexión residual + LayerNorm.
+    * `n_heads` y `ff_dim` aceptan un entero (igual en todos los bloques) o una
+      lista con un valor por bloque, p. ej. para que crezcan con la profundidad:
+          n_heads=[4, 8, 16], ff_dim=[512, 1024, 2048]
+      El ancho entre bloques (hidden_dim) es fijo porque las residuales suman
+      z + f(z); lo que cambia es el ancho interno de la FFN y el número de
+      cabezas (cada cabeza tiene d_k = hidden_dim / n_heads). ff_dim=0 quita la
+      feed-forward de ese bloque.
     * `use_attention=False` quita la subcapa de atención de cada bloque y deja
       todo lo demás idéntico: es la ablación que pide el punto 4.
 """
 
 import math
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -144,25 +150,27 @@ class MaskedMultiHeadAttention(nn.Module):
 # --------------------------------------------------------------------------
 class AttentionBlock(nn.Module):
     """z = LayerNorm(z + Dropout(Attention(z)))
-    z = LayerNorm(z + Dropout(FFN(z)))        FFN = Linear -> ReLU -> Linear
+    z = LayerNorm(z + Dropout(FFN(z)))        FFN = Linear(hidden, ff_dim) -> ReLU -> Linear(ff_dim, hidden)
 
     use_attention=False quita la subcapa de atención (ablación del punto 4).
-    ff_mult=0 quita la feed-forward (bloque sólo de atención)."""
+    ff_dim=0 quita la feed-forward (bloque sólo de atención)."""
 
-    def __init__(self, hidden_dim: int, n_heads: int, dropout: float,
-                 use_attention: bool = True, ff_mult: int = 4):
+    def __init__(self, hidden_dim: int, n_heads: int, ff_dim: int, dropout: float,
+                 use_attention: bool = True):
         super().__init__()
         self.use_attention = use_attention
+        self.n_heads = n_heads
+        self.ff_dim = ff_dim
         if use_attention:
             self.attn = MaskedMultiHeadAttention(hidden_dim, n_heads, dropout=0.1)
             self.norm1 = nn.LayerNorm(hidden_dim)
         self.ff = None
-        if ff_mult > 0:
+        if ff_dim > 0:
             self.ff = nn.Sequential(
-                nn.Linear(hidden_dim, ff_mult * hidden_dim),
+                nn.Linear(hidden_dim, ff_dim),
                 nn.ReLU(),
                 nn.Dropout(dropout),
-                nn.Linear(ff_mult * hidden_dim, hidden_dim),
+                nn.Linear(ff_dim, hidden_dim),
             )
             self.norm2 = nn.LayerNorm(hidden_dim)
         self.drop = nn.Dropout(dropout)
@@ -180,11 +188,21 @@ class AttentionBlock(nn.Module):
 # --------------------------------------------------------------------------
 # Modelo
 # --------------------------------------------------------------------------
+def _per_block(value: Union[int, Sequence[int]], n_blocks: int, name: str) -> List[int]:
+    """Convierte un entero o una lista en una lista con un valor por bloque."""
+    if isinstance(value, int):
+        return [value] * n_blocks
+    value = list(value)
+    if len(value) != n_blocks:
+        raise ValueError(f"{name} tiene {len(value)} valores pero n_attn_layers={n_blocks}")
+    return value
+
+
 class RNNAttentionLM(nn.Module):
     def __init__(self, vocab_size: int, emb_dim: int = 256, hidden_dim: int = 512,
-                 num_layers: int = 2, n_heads: int = 4, dropout: float = 0.4,
+                 num_layers: int = 2, n_heads: Union[int, Sequence[int]] = 4, dropout: float = 0.4,
                  rnn_type: str = "lstm", use_attention: bool = True, pad_id: int = 0,
-                 n_attn_layers: int = 10, ff_mult: int = 4):
+                 n_attn_layers: int = 10, ff_dim: Optional[Union[int, Sequence[int]]] = None):
         super().__init__()
         self.use_attention = use_attention
         self.emb = nn.Embedding(vocab_size, emb_dim, padding_idx=pad_id)
@@ -192,9 +210,17 @@ class RNNAttentionLM(nn.Module):
         rnn_cls = {"lstm": nn.LSTM, "gru": nn.GRU}[rnn_type.lower()]
         self.rnn = rnn_cls(emb_dim, hidden_dim, num_layers=num_layers, batch_first=True,
                            dropout=dropout if num_layers > 1 else 0.0)
+
+        # Configuración por bloque (entero = igual en todos; lista = un valor por bloque)
+        self.n_heads = _per_block(n_heads, n_attn_layers, "n_heads")
+        self.ff_dims = _per_block(4 * hidden_dim if ff_dim is None else ff_dim, n_attn_layers, "ff_dim")
+        for l, h in enumerate(self.n_heads):
+            if hidden_dim % h != 0:
+                raise ValueError(f"Bloque {l + 1}: hidden_dim={hidden_dim} no es divisible entre n_heads={h}")
+
         # (atención -> feed-forward) x n_attn_layers
-        self.blocks = nn.ModuleList([AttentionBlock(hidden_dim, n_heads, dropout, use_attention, ff_mult)
-                                     for _ in range(n_attn_layers)])
+        self.blocks = nn.ModuleList([AttentionBlock(hidden_dim, h, f, dropout, use_attention)
+                                     for h, f in zip(self.n_heads, self.ff_dims)])
         self.out_drop = nn.Dropout(dropout)
         self.out = nn.Linear(hidden_dim, vocab_size)
 
@@ -211,6 +237,17 @@ class RNNAttentionLM(nn.Module):
 
 def count_parameters(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def describe_blocks(model: RNNAttentionLM) -> List[dict]:
+    """Una fila por bloque: cabezas, d_k, ancho de la FFN y parámetros."""
+    hidden = model.out.in_features
+    return [{"bloque": l + 1,
+             "cabezas": b.n_heads if b.use_attention else 0,
+             "d_k": hidden // b.n_heads if b.use_attention else 0,
+             "ff_dim": b.ff_dim,
+             "parámetros": count_parameters(b)}
+            for l, b in enumerate(model.blocks)]
 
 
 # --------------------------------------------------------------------------
