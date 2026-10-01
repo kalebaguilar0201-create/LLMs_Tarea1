@@ -1,25 +1,31 @@
 """
-Puntos 1 y 4 — Recurrent Language Model con Self-Attention.
+Puntos 1 y 4 — Recurrent Language Model con Self-Attention (bloques apilados).
 
 Arquitectura (a nivel palabra, un tuit por secuencia):
 
-    x_1..x_T --Embedding--> e_t --LSTM apilada (unidireccional)--> h_t
+    x_1..x_T --Embedding--> e_t --LSTM o GRU (unidireccional)--> h_t = z^(0)
                                                                     |
+     para l = 1..L  (L = n_attn_layers, por defecto 10):            |
                Self-attention causal tipo Transformer (Q, K, V) <---+
-                    Q = h W_Q,  K = h W_K,  V = h W_V
+                    Q = z W_Q^l,  K = z W_K^l,  V = z W_V^l
                     A = softmax( Q K^T / sqrt(d_k)  + máscara causal )
                     c_t = sum_{j<=t} A_tj V_j            (multi-cabeza)
+                    u_t = tanh( W_c^l [z_t ; c_t] )
+                    z^(l) = LayerNorm( z^(l-1) + dropout(u) )   (residual)
                                                                     |
-               z_t = tanh( W_c [h_t ; c_t] )  --dropout--> softmax(W_o z_t)
+               logits = W_o  dropout(z^(L))  --> softmax
 
 Notas de diseño:
-    * La LSTM es UNIDIRECCIONAL: una bidireccional "vería" el futuro y no
-      sería un modelo de lenguaje válido (P(w_t | w_<t)).
-    * La máscara causal impide que la posición t atienda a posiciones j > t.
-      Como el padding está a la derecha, la máscara causal también evita que
-      los tokens reales atiendan a <pad>.
-    * `use_attention=False` elimina el bloque de atención (z_t = tanh(W h_t)),
-      con el resto idéntico: es la ablación que pide el punto 4.
+    * `rnn_type` = 'lstm' o 'gru'. La RNN es UNIDIRECCIONAL: una bidireccional
+      "vería" el futuro y no sería un modelo de lenguaje válido (P(w_t | w_<t)).
+    * Cada bloque usa máscara causal, así que aun apilando L bloques la
+      posición t sólo depende de posiciones j <= t. Como el padding está a la
+      derecha, la máscara causal también evita que los tokens reales atiendan a <pad>.
+    * La conexión residual + LayerNorm en cada bloque facilita entrenar varios
+      bloques apilados (evita que el gradiente se atenúe a través de varios tanh).
+    * `use_attention=False` elimina la atención de cada bloque
+      (u_t = tanh(W_c^l z_t)) y deja todo lo demás idéntico (mismo número de
+      bloques, residual y LayerNorm): es la ablación que pide el punto 4.
 """
 
 import math
@@ -95,7 +101,7 @@ class CausalSelfAttention(nn.Module):
         self.drop = nn.Dropout(dropout)
 
     def forward(self, h: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # h: (B, T, d_model) -> estados ocultos de la LSTM
+        # h: (B, T, d_model) -> estados de la RNN o salida del bloque anterior
         B, T, _ = h.shape
 
         def split(t):  # (B, T, d) -> (B, heads, T, d_k)
@@ -115,12 +121,41 @@ class CausalSelfAttention(nn.Module):
 
 
 # --------------------------------------------------------------------------
+# Bloque: atención + feed-forward (W_c), con residual y LayerNorm
+# --------------------------------------------------------------------------
+class AttentionBlock(nn.Module):
+    """z -> att(z) -> tanh(W_c [z ; c]) -> LayerNorm(z + ...)
+    Con use_attention=False el bloque sólo hace tanh(W_c z) (ablación)."""
+
+    def __init__(self, hidden_dim: int, n_heads: int, dropout: float, use_attention: bool = True):
+        super().__init__()
+        self.use_attention = use_attention
+        if use_attention:
+            self.attn = CausalSelfAttention(hidden_dim, n_heads, dropout=0.1)
+            self.ff = nn.Linear(2 * hidden_dim, hidden_dim)      # W_c [z ; c]
+        else:
+            self.ff = nn.Linear(hidden_dim, hidden_dim)          # W_c z
+        self.drop = nn.Dropout(dropout)
+        self.norm = nn.LayerNorm(hidden_dim)
+
+    def forward(self, z: torch.Tensor):
+        a = None
+        if self.use_attention:
+            c, a = self.attn(z)
+            u = torch.tanh(self.ff(torch.cat([z, c], dim=-1)))
+        else:
+            u = torch.tanh(self.ff(z))
+        return self.norm(z + self.drop(u)), a
+
+
+# --------------------------------------------------------------------------
 # Modelo
 # --------------------------------------------------------------------------
 class RNNAttentionLM(nn.Module):
     def __init__(self, vocab_size: int, emb_dim: int = 256, hidden_dim: int = 512,
                  num_layers: int = 2, n_heads: int = 4, dropout: float = 0.4,
-                 rnn_type: str = "lstm", use_attention: bool = True, pad_id: int = 0):
+                 rnn_type: str = "lstm", use_attention: bool = True, pad_id: int = 0,
+                 n_attn_layers: int = 10):
         super().__init__()
         self.use_attention = use_attention
         self.emb = nn.Embedding(vocab_size, emb_dim, padding_idx=pad_id)
@@ -128,27 +163,21 @@ class RNNAttentionLM(nn.Module):
         rnn_cls = {"lstm": nn.LSTM, "gru": nn.GRU}[rnn_type.lower()]
         self.rnn = rnn_cls(emb_dim, hidden_dim, num_layers=num_layers, batch_first=True,
                            dropout=dropout if num_layers > 1 else 0.0)
-        if use_attention:
-            self.attn = CausalSelfAttention(hidden_dim, n_heads, dropout=0.1)
-            self.combine = nn.Linear(2 * hidden_dim, hidden_dim)   # W_c [h_t ; c_t]
-        else:
-            self.attn = None
-            self.combine = nn.Linear(hidden_dim, hidden_dim)       # W_c h_t
+        # att -> ff -> att -> ff -> att -> ff
+        self.blocks = nn.ModuleList([AttentionBlock(hidden_dim, n_heads, dropout, use_attention)
+                                     for _ in range(n_attn_layers)])
         self.out_drop = nn.Dropout(dropout)
         self.out = nn.Linear(hidden_dim, vocab_size)
 
     def forward(self, x: torch.Tensor, return_attention: bool = False):
         # x: (B, T)
-        e = self.emb_drop(self.emb(x))
-        h, _ = self.rnn(e)                                  # (B, T, hidden)
-        attn = None
-        if self.use_attention:
-            c, attn = self.attn(h)
-            z = torch.tanh(self.combine(torch.cat([h, c], dim=-1)))
-        else:
-            z = torch.tanh(self.combine(h))
-        logits = self.out(self.out_drop(z))                 # (B, T, V)
-        return (logits, attn) if return_attention else logits
+        z, _ = self.rnn(self.emb_drop(self.emb(x)))          # (B, T, hidden)
+        attns = []
+        for block in self.blocks:
+            z, a = block(z)
+            attns.append(a)
+        logits = self.out(self.out_drop(z))                  # (B, T, V)
+        return (logits, attns) if return_attention else logits
 
 
 def count_parameters(model: nn.Module) -> int:
@@ -191,10 +220,12 @@ def sentence_logprob(model: RNNAttentionLM, vocab: Vocab, text: str,
 
 @torch.no_grad()
 def attention_map(model: RNNAttentionLM, vocab: Vocab, text: str,
-                  device: torch.device = torch.device("cpu")) -> Tuple[List[str], torch.Tensor]:
-    """Regresa los tokens de entrada y la matriz de atención promedio de las cabezas (T x T)."""
+                  device: torch.device = torch.device("cpu"),
+                  layer: int = -1) -> Tuple[List[str], torch.Tensor]:
+    """Tokens de entrada y matriz de atención (T x T) del bloque `layer`
+    (por defecto el último), promediando las cabezas."""
     assert model.use_attention, "El modelo no tiene atención"
     model.eval()
     ids = [vocab.sos_id] + vocab.encode(text)
-    _, attn = model(torch.tensor([ids], device=device), return_attention=True)
-    return vocab.decode(ids, skip_specials=False), attn[0].mean(0).cpu()
+    _, attns = model(torch.tensor([ids], device=device), return_attention=True)
+    return vocab.decode(ids, skip_specials=False), attns[layer][0].mean(0).cpu()

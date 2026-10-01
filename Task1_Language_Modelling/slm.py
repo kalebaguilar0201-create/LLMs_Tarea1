@@ -20,7 +20,7 @@ la perplejidad es directamente comparable.
 import math
 import random
 from collections import Counter
-from typing import Optional, Sequence
+from typing import List, Optional, Sequence
 
 from common import EOS, PAD, SOS, UNK, Vocab, perplexity_from_nll
 
